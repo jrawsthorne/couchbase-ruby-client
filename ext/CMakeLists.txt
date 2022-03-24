@@ -14,7 +14,16 @@ if(RUBY_INCLUDE_DIR)
   include_directories(BEFORE SYSTEM "${RUBY_INCLUDE_DIR}")
 endif()
 
+set(COUCHBASE_CXX_CLIENT_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(COUCHBASE_CXX_CLIENT_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(COUCHBASE_CXX_CLIENT_POST_LINKED_OPENSSL ON CACHE BOOL "" FORCE)
 add_subdirectory(couchbase)
+
+set(COUCHBASE_TXNS_CXX_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(COUCHBASE_TXNS_CXX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(COUCHBASE_TXNS_CXX_BUILD_DOC OFF CACHE BOOL "" FORCE)
+set(COUCHBASE_TXNS_CXX_CLIENT_EXTERNAL ON CACHE BOOL "" FORCE)
+add_subdirectory(couchbase-transactions-cxx)
 
 if(NOT EXT_GIT_REVISION)
   find_program(GIT git)
@@ -41,8 +50,8 @@ constexpr auto RUBY_INCLUDE_DIR = \"${RUBY_INCLUDE_DIR}\";
 ")
 
 add_library(couchbase SHARED couchbase.cxx)
-target_include_directories(couchbase PRIVATE ${PROJECT_BINARY_DIR}/generated)
-target_link_libraries(couchbase PRIVATE project_options project_warnings couchbase_cxx_client snappy)
+target_include_directories(couchbase PRIVATE ${PROJECT_BINARY_DIR}/generated couchbase-transactions-cxx/include)
+target_link_libraries(couchbase PRIVATE project_options project_warnings couchbase_cxx_client snappy transactions_cxx)
 if (CMAKE_C_COMPILER_ID MATCHES ".*Clang")
   target_compile_options(couchbase PRIVATE -fdeclspec)
 endif()

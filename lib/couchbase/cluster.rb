@@ -15,6 +15,7 @@
 require "couchbase/configuration"
 require "couchbase/authenticator"
 require "couchbase/bucket"
+require "couchbase/transactions"
 
 require "couchbase/management"
 require "couchbase/options"
@@ -72,6 +73,11 @@ module Couchbase
     # @return [Bucket]
     def bucket(name)
       Bucket.new(@backend, name)
+    end
+
+    def transactions
+      @transactions ||= Transactions.new(@backend)
+      @transactions
     end
 
     # Performs a query against the query (N1QL) services
@@ -288,6 +294,7 @@ module Couchbase
     #
     # @return [void]
     def disconnect
+      @transactions.close if @transactions
       @backend.close
     end
 

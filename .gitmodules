@@ -4,3 +4,6 @@
 [submodule "ext/couchbase"]
 	path = ext/couchbase
 	url = https://github.com/couchbaselabs/couchbase-cxx-client.git
+[submodule "ext/couchbase-transactions-cxx"]
+	path = ext/couchbase-transactions-cxx
+	url = https://github.com/couchbaselabs/couchbase-transactions-cxx

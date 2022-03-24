@@ -25,6 +25,8 @@
 
 #include <snappy.h>
 
+#include <memory>
+
 #include <couchbase/platform/terminate_handler.h>
 
 #include <couchbase/cluster.hxx>
@@ -38,6 +40,11 @@
 #include <couchbase/operations/management/search.hxx>
 #include <couchbase/operations/management/user.hxx>
 #include <couchbase/operations/management/view.hxx>
+
+#include <couchbase/transactions.hxx>
+#include <couchbase/transactions/internal/transaction_context.hxx>
+#include <couchbase/transactions/internal/exceptions_internal.hxx>
+#include <couchbase/transactions/internal/utils.hxx>
 
 #include <couchbase/io/dns_client.hxx>
 #include <couchbase/utils/connection_string.hxx>
@@ -7286,6 +7293,219 @@ cb_Backend_form_encode(VALUE self, VALUE data)
     return cb_str_new(encoded);
 }
 
+struct cb_transactions_data {
+    std::shared_ptr<couchbase::transactions::transactions> _impl;
+};
+
+struct cb_transaction_context_data {
+    std::shared_ptr<couchbase::transactions::transaction_context> _impl;
+};
+
+static void
+cb_transactions_mark(void* /* ptr */)
+{
+    /* no embeded ruby objects -- no mark */
+}
+
+static void
+cb_transaction_context_mark(void* /* ptr */)
+{
+    /* no embeded ruby objects -- no mark */
+}
+
+static void
+cb_transactions_free(void* ptr)
+{
+    auto* transactions = static_cast<cb_transactions_data*>(ptr);
+    // cb_backend_close(backend);
+    ruby_xfree(transactions);
+}
+
+static void
+cb_transaction_context_free(void* ptr)
+{
+    auto* transaction_context = static_cast<cb_transaction_context_data*>(ptr);
+    // cb_backend_close(backend);
+    ruby_xfree(transaction_context);
+}
+
+static size_t
+cb_transactions_memsize(const void* ptr)
+{
+    const auto* transactions = static_cast<const cb_transactions_data*>(ptr);
+    return sizeof(*transactions) + sizeof(*transactions->_impl);
+}
+
+static size_t
+cb_transaction_context_memsize(const void* ptr)
+{
+    const auto* transaction_context = static_cast<const cb_transaction_context_data*>(ptr);
+    return sizeof(*transaction_context) + sizeof(*transaction_context->_impl);
+}
+
+static const rb_data_type_t cb_transactions_type{
+    "Couchbase/TransactionsBackend",
+    { cb_transactions_mark,
+      cb_transactions_free,
+      cb_transactions_memsize,
+// only one reserved field when GC.compact implemented
+#ifdef T_MOVED
+      nullptr,
+#endif
+      {} },
+#ifdef RUBY_TYPED_FREE_IMMEDIATELY
+    nullptr,
+    nullptr,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+#endif
+};
+
+static const rb_data_type_t cb_transaction_context_type{
+    "Couchbase/TransactionContextBackend",
+    { cb_transaction_context_mark,
+      cb_transaction_context_free,
+      cb_transaction_context_memsize,
+// only one reserved field when GC.compact implemented
+#ifdef T_MOVED
+      nullptr,
+#endif
+      {} },
+#ifdef RUBY_TYPED_FREE_IMMEDIATELY
+    nullptr,
+    nullptr,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+#endif
+};
+
+static inline const std::shared_ptr<couchbase::transactions::transactions>&
+cb_transactions_to_impl(VALUE self)
+{
+    const cb_transactions_data* transactions = nullptr;
+    TypedData_Get_Struct(self, cb_transactions_data, &cb_transactions_type, transactions);
+
+    if (!transactions->_impl) {
+        rb_raise(rb_eArgError, "Transactions object has been closed already");
+    }
+    return transactions->_impl;
+}
+
+static inline const std::shared_ptr<couchbase::transactions::transaction_context>&
+cb_transaction_context_to_impl(VALUE self)
+{
+    const cb_transaction_context_data* transaction_context = nullptr;
+    TypedData_Get_Struct(self, cb_transaction_context_data, &cb_transaction_context_type, transaction_context);
+
+    if (!transaction_context->_impl) {
+        rb_raise(rb_eArgError, "Transaction Context object has been closed already");
+    }
+    return transaction_context->_impl;
+}
+
+static VALUE
+cb_transactions_backend(VALUE self, VALUE backend)
+{
+    cb_transactions_data* transactions = nullptr;
+    TypedData_Get_Struct(self, cb_transactions_data, &cb_transactions_type, transactions);
+    auto cluster = cb_backend_to_cluster(backend);
+    const auto config = couchbase::transactions::transaction_config();
+    transactions->_impl.reset(new couchbase::transactions::transactions(*cluster, config));
+    return self;
+}
+
+static VALUE
+cb_transaction_context_backend(VALUE self, VALUE transactions_backend)
+{
+    cb_transaction_context_data* transaction_context = nullptr;
+    TypedData_Get_Struct(self, cb_transaction_context_data, &cb_transaction_context_type, transaction_context);
+    auto transactions = cb_transactions_to_impl(transactions_backend);
+    transaction_context->_impl.reset(new couchbase::transactions::transaction_context(*transactions));
+    return self;
+}
+
+static VALUE
+cb_transactions_backend_allocate(VALUE klass)
+{
+    cb_transactions_data* transactions = nullptr;
+    VALUE obj = TypedData_Make_Struct(klass, cb_transactions_data, &cb_transactions_type, transactions);
+    transactions->_impl = nullptr;
+    return obj;
+}
+
+static VALUE
+cb_transaction_context_backend_allocate(VALUE klass)
+{
+    cb_transaction_context_data* transaction_context = nullptr;
+    VALUE obj = TypedData_Make_Struct(klass, cb_transaction_context_data, &cb_transaction_context_type, transaction_context);
+    transaction_context->_impl = nullptr;
+    return obj;
+}
+
+static VALUE
+cb_transaction_context_new_attempt(VALUE self)
+{
+    auto transaction_context = cb_transaction_context_to_impl(self);
+    auto barrier = std::make_shared<std::promise<std::exception_ptr>>();
+    auto f = barrier->get_future();
+    transaction_context->new_attempt_context([barrier](std::exception_ptr err) {
+        barrier->set_value(std::move(err));
+    });
+    if (auto err = cb_wait_for_future(f); err) {
+        // raise correct exception
+    }
+    return Qnil;
+}
+
+static VALUE
+cb_transaction_context_commit(VALUE self)
+{
+    auto transaction_context = cb_transaction_context_to_impl(self);
+    auto barrier = std::make_shared<std::promise<couchbase::transactions::transaction_result>>();
+    auto f = barrier->get_future();
+    transaction_context->finalize([barrier](std::optional<couchbase::transactions::transaction_exception>,
+                        std::optional<couchbase::transactions::transaction_result> res) {
+        // if (err.has_value()) {
+        //     barrier->set_exception(err.value());
+        // } else {
+        barrier->set_value(res.value());
+        // }
+    });
+
+    auto resp = cb_wait_for_future(f);
+
+    VALUE res = rb_hash_new();
+        
+    rb_hash_aset(res, rb_id2sym(rb_intern("transaction_id")), cb_str_new(resp.transaction_id));
+    rb_hash_aset(res, rb_id2sym(rb_intern("unstaging_complete")), resp.unstaging_complete ? Qtrue : Qfalse);
+    return res;
+
+    // if (auto err = cb_wait_for_future(f); err.has_value()) {
+    //     // raise correct exception
+    // }
+}
+
+static VALUE
+cb_transaction_context_rollbackt(VALUE self)
+{
+    auto transaction_context = cb_transaction_context_to_impl(self);
+    auto barrier = std::make_shared<std::promise<std::exception_ptr>>();
+    auto f = barrier->get_future();
+    transaction_context->rollback([barrier](std::exception_ptr err) {
+        barrier->set_value(std::move(err));
+    });
+    if (auto err = cb_wait_for_future(f); err) {
+        // raise correct exception
+    }
+    return Qnil;
+}
+
+// static VALUE
+// cb_transactions_run(VALUE self)
+// {
+//     const auto& transactions = cb_transactions_extract(self);
+//     rb_yield(Qundef);
+//     return Qnil;
+// }
+
 static void
 init_backend(VALUE mCouchbase)
 {
@@ -7404,6 +7624,19 @@ init_backend(VALUE mCouchbase)
     rb_define_singleton_method(cBackend, "query_escape", VALUE_FUNC(cb_Backend_query_escape), 1);
     rb_define_singleton_method(cBackend, "path_escape", VALUE_FUNC(cb_Backend_path_escape), 1);
     rb_define_singleton_method(cBackend, "form_encode", VALUE_FUNC(cb_Backend_form_encode), 1);
+
+    // transactions 
+
+    VALUE cTransactionsBackend = rb_define_class_under(mCouchbase, "TransactionsBackend", rb_cBasicObject);
+    rb_define_alloc_func(cTransactionsBackend, cb_transactions_backend_allocate);
+    rb_define_method(cTransactionsBackend, "initialize", VALUE_FUNC(cb_transactions_backend), 1);
+
+    VALUE cTransactionContextBackend = rb_define_class_under(mCouchbase, "TransactionContextBackend", rb_cBasicObject);
+    rb_define_alloc_func(cTransactionContextBackend, cb_transaction_context_backend_allocate);
+    rb_define_method(cTransactionContextBackend, "initialize", VALUE_FUNC(cb_transaction_context_backend), 1);
+    rb_define_method(cTransactionContextBackend, "new_attempt", VALUE_FUNC(cb_transaction_context_new_attempt), 0);
+    rb_define_method(cTransactionContextBackend, "commit", VALUE_FUNC(cb_transaction_context_commit), 0);
+    rb_define_method(cTransactionContextBackend, "rollback", VALUE_FUNC(cb_transaction_context_rollbackt), 0);
 }
 
 void
